@@ -398,7 +398,7 @@ class CMakeBuild(BuildExtension):
             ["cmake", "--build", ".", "--verbose", *build_args], cwd=build_temp, check=True
         )
 
-if CUDA_HOME is not None or ROCM_HOME is not None:
+if CUDA_HOME is not None:
     ops_module = CUDAExtension('KTransformersOps', [
         'ktransformers/ktransformers_ext/cuda/custom_gguf/dequant.cu',
         'ktransformers/ktransformers_ext/cuda/binding.cpp',
@@ -408,9 +408,25 @@ if CUDA_HOME is not None or ROCM_HOME is not None:
             'cxx': ['-O3', '-DKTRANSFORMERS_USE_CUDA'],
             'nvcc': [
                 '-O3',
-                # '--use_fast_math',
+                '--use_fast_math',
                 '-Xcompiler', '-fPIC',
                 '-DKTRANSFORMERS_USE_CUDA',
+            ]
+        }
+    )
+elif ROCM_HOME is not None:
+    ops_module = CUDAExtension('KTransformersOps', [
+        'ktransformers/ktransformers_ext/cuda/custom_gguf/dequant.cu',
+        'ktransformers/ktransformers_ext/cuda/binding.cpp',
+        'ktransformers/ktransformers_ext/cuda/gptq_marlin/gptq_marlin.cu'
+    ],
+    extra_compile_args={
+            'cxx': ['-O3', '-DKTRANSFORMERS_USE_ROCM'],
+            'nvcc': [
+                '-O3',
+                '-ffast-math',
+                '-fPIC',
+                '-DKTRANSFORMERS_USE_ROCM',
             ]
         }
     )

@@ -36,7 +36,7 @@ inline std::string str(T x) {
 
 namespace gptq_marlin {
 
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800) || defined(__HIP_PLATFORM_AMD__)
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
 
 __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
                                     int const* __restrict__ perm_int_ptr,
@@ -119,10 +119,18 @@ template <typename scalar_t>
 __device__ inline void ldsm4(typename ScalarType<scalar_t>::FragA& frag_a,
                              const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  uint32_t smem = cvta_to_shared(smem_ptr);
+  #ifdef USE_ROCM
+  asm volatile(
+      "ds_read_b128 %0, %1 offset:0\n"
+      "ds_read_b128 %2, %1 offset:16\n"
+      : "=v"(a[0]), "=v"(a[1]), "=v"(a[2]), "=v"(a[3])
+      : "v"(smem));
+  #else
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                : "r"(smem));
+  #endif
 }
 
 // Lookup-table based 3-input logical operation; explicitly used for
@@ -131,9 +139,16 @@ __device__ inline void ldsm4(typename ScalarType<scalar_t>::FragA& frag_a,
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
   int res;
+  #ifdef USE_ROCM
+  // AMD GPUs don't have a direct equivalent to lop3, so we implement it using bitwise operations
+  res = (a & b & c) | (a & b & ~c) | (a & ~b & c) | (~a & b & c);
+  // Apply the LUT
+  res = (res & lut) | (~res & ~lut);
+  #else
   asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                : "=r"(res)
                : "r"(a), "r"(b), "r"(c), "n"(lut));
+  #endif
   return res;
 }
 
@@ -142,9 +157,13 @@ __device__ inline int lop3(int a, int b, int c) {
 template <int start_byte, int mask>
 __device__ inline uint32_t prmt(uint32_t a) {
   uint32_t res;
+  #ifdef USE_CUDA
   asm volatile("prmt.b32 %0, %1, %2, %3;\n"
                : "=r"(res)
                : "r"(a), "n"(start_byte), "n"(mask));
+  #else
+  res = __byte_perm(a, start_byte, mask);
+  #endif
   return res;
 }
 
@@ -174,11 +193,24 @@ __device__ inline typename ScalarType<half>::FragB dequant_4bit<half>(int q) {
   const int MUL = 0x2c002c00;
   const int ADD = 0xd480d480;
   typename ScalarType<half>::FragB frag_b;
+  // #ifdef USE_ROCM
+  // // AMD implementation
+  // __half2* lo_ptr = reinterpret_cast<__half2*>(&lo);
+  // __half2* hi_ptr = reinterpret_cast<__half2*>(&hi);
+  // const __half2* SUB_ptr = reinterpret_cast<const __half2*>(&SUB);
+  // const __half2* MUL_ptr = reinterpret_cast<const __half2*>(&MUL);
+  // const __half2* ADD_ptr = reinterpret_cast<const __half2*>(&ADD);
+
+  // frag_b[0] = __hsub(*lo_ptr, *SUB_ptr);
+  // frag_b[1] = __hfma(*hi_ptr, *MUL_ptr, *ADD_ptr);
+  // #else
+  // // NVIDIA implementation
   frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
                       *reinterpret_cast<const half2*>(&SUB));
   frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
                       *reinterpret_cast<const half2*>(&MUL),
                       *reinterpret_cast<const half2*>(&ADD));
+  // #endif
   return frag_b;
 }
 
@@ -230,10 +262,21 @@ __device__ inline typename ScalarType<half>::FragB dequant_8bit<half>(int q) {
   static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
 
   typename ScalarType<half>::FragB frag_b;
+  // #ifdef USE_ROCM
+  // // AMD implementation
+  // __half2* lo_ptr = reinterpret_cast<__half2*>(&lo);
+  // __half2* hi_ptr = reinterpret_cast<__half2*>(&hi);
+  // const __half2* magic_num_ptr = reinterpret_cast<const __half2*>(&I8s_TO_F16s_MAGIC_NUM);
+
+  // frag_b[0] = __hsub(*lo_ptr, *magic_num_ptr);
+  // frag_b[1] = __hsub(*hi_ptr, *magic_num_ptr);
+  // #else
+  // // NVIDIA implementation
   frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
   frag_b[1] = __hsub2(*reinterpret_cast<half2*>(&hi),
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
+  // #endif
   return frag_b;
 }
 
@@ -275,8 +318,15 @@ __device__ inline void scale(typename ScalarType<scalar_t>::FragB& frag_b,
   using scalar_t2 = typename ScalarType<scalar_t>::scalar_t2;
   scalar_t2 s =
       ScalarType<scalar_t>::num2num2(reinterpret_cast<scalar_t*>(&frag_s)[i]);
+  // #ifdef USE_ROCM
+  // // AMD implementation
+  // frag_b[0] = __hmul(frag_b[0], s);
+  // frag_b[1] = __hmul(frag_b[1], s);
+  // #else
+  // // NVIDIA implementation
   frag_b[0] = __hmul2(frag_b[0], s);
   frag_b[1] = __hmul2(frag_b[1], s);
+  // #endif
 }
 
 // Same as above, but for act_order (each K is multiplied individually)
@@ -313,13 +363,20 @@ __device__ inline void scale_float(float* c,
 __device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) {
     int state = -1;
-    do
+    do {
       // Guarantee that subsequent writes by this threadblock will be visible
       // globally.
+      #ifdef USE_ROCM
+      asm volatile("flat_load_dword %0, %1 glc\n\t"
+                   "s_waitcnt vmcnt(0) & lgkmcnt(0)\n\t"
+                   : "=v"(state)
+                   : "v"(lock));
+      #else
       asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
                    : "=r"(state)
                    : "l"(lock));
-    while (state != count);
+      #endif
+    } while (state != count);
   }
   __syncthreads();
 }
@@ -335,10 +392,19 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
     int val = 1;
     // Make sure that all writes since acquiring this barrier are visible
     // globally, while releasing the barrier.
+    #ifdef USE_ROCM
+    asm volatile("s_waitcnt vmcnt(0) & lgkmcnt(0)\n\t"
+                 "s_memrealtime\n\t"
+                 "s_waitcnt vmcnt(0) & lgkmcnt(0)\n\t"
+                 "flat_atomic_add_i32 %0, %1\n\t"
+                 : "+v"(*lock)
+                 : "v"(val));
+    #else
     asm volatile("fence.acq_rel.gpu;\n");
     asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
                  :
                  : "l"(lock), "r"(val));
+    #endif
   }
 }
 
